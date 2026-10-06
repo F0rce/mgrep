@@ -15,6 +15,9 @@ setup() {
     export MGREP_IS_TEST=1
     export MGREP_TEST_STORE_PATH="$BATS_TEST_TMPDIR/mgrep-test-store.json"
     export XDG_STATE_HOME="$BATS_TEST_TMPDIR/state"
+    export MGREP_WATCH_REGISTRY_DIR="$BATS_TEST_TMPDIR/registry"
+    export MGREP_WATCH_POLL_MS=100
+    PIDS=()
     unset MGREP_MCP_WAIT_FOR MGREP_MCP_ROOTS MGREP_MCP_FORBID_ROOTS MGREP_MCP_SYNC_WAIT_MS
 
     mkdir -p "$BATS_TEST_TMPDIR/test-store"
@@ -23,6 +26,14 @@ setup() {
     printf 'Hello, world!\nA third one.\n' > "$BATS_TEST_TMPDIR/test-store/test-3.txt"
     cd "$BATS_TEST_TMPDIR/test-store"
     mgrep search --sync test
+}
+
+teardown() {
+    if [ -f "$BATS_TEST_TMPDIR/mcp.pid" ]; then
+        PIDS+=("$(cat "$BATS_TEST_TMPDIR/mcp.pid")")
+    fi
+    for pid in "${PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+    for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 
 mcp_client() {
@@ -529,7 +540,139 @@ assert.equal(process.exitCode || 0, ['home', 'quota', 'file-count', 'store-error
 process.exitCode = 0;
 fs.rmSync('contract-a.txt', { force: true });
 fs.rmSync('contract-b.txt', { force: true });
+if (watching) process.emit('SIGTERM');
 JS
         assert_success
     done
+}
+
+@test "MCP covered watcher searches promptly without syncing and takes over after SIGTERM" {
+    export MGREP_WATCH_QUOTA_BACKOFF_MS=300
+    local failure
+    for failure in none quota file-count; do
+    mgrep watch > "$BATS_TEST_TMPDIR/active.log" 2>&1 3>&- &
+    local active=$!
+    PIDS+=("$active")
+    for _ in {1..100}; do
+        if grep -q 'Initial sync complete' "$BATS_TEST_TMPDIR/active.log"; then break; fi
+        sleep 0.05
+    done
+    grep -q 'Initial sync complete' "$BATS_TEST_TMPDIR/active.log"
+    export MGREP_MCP_SYNC_WAIT_MS=30000
+    run node --input-type=module - "$DIR/.." "$active" "$BATS_TEST_TMPDIR/mcp.pid" "$failure" <<'JS'
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
+const base = pathToFileURL(`${process.argv[2]}/`).href;
+const { Client } = await import(`${base}node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js`);
+const { StdioClientTransport } = await import(`${base}node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js`);
+const failure = process.argv[5];
+const preload = `import { TestStore } from ${JSON.stringify(`${base}dist/lib/store.js`)};
+import { QuotaExceededError, MaxFileCountExceededError } from ${JSON.stringify(`${base}dist/lib/utils.js`)};
+const list = TestStore.prototype.listFiles;
+let fail = ${JSON.stringify(failure)};
+TestStore.prototype.listFiles = async function* (...args) {
+  console.error('coordination test sync pass');
+  const current = fail;
+  fail = 'none';
+  if (current === 'quota') throw new QuotaExceededError('takeover quota test');
+  if (current === 'file-count') throw new MaxFileCountExceededError(2, 1);
+  yield* list.apply(this, args);
+};`;
+const transport = new StdioClientTransport({
+  command: 'mgrep', args: ['mcp', '--expose-tools'], stderr: 'pipe',
+  env: {...process.env, NODE_OPTIONS: `--import=data:text/javascript;base64,${Buffer.from(preload).toString('base64')}`},
+});
+const client = new Client({name: 'coordination-test', version: '1.0.0'});
+let stderr = '';
+transport.stderr.on('data', chunk => { stderr += chunk.toString(); });
+const deadline = setTimeout(() => {
+  console.error(stderr);
+  if (transport.pid) process.kill(transport.pid, 'SIGTERM');
+  process.exit(1);
+}, 15000);
+const waitFor = async predicate => {
+  const end = performance.now() + 5000;
+  while (!predicate()) {
+    assert.ok(performance.now() < end, stderr);
+    await delay(25);
+  }
+};
+try {
+  await client.connect(transport);
+  const pid = transport.pid;
+  fs.writeFileSync(process.argv[4], String(pid));
+  const start = performance.now();
+  const result = await client.callTool({name: 'search', arguments: {query: 'test', path: '.'}});
+  const elapsedMs = performance.now() - start;
+  assert.ok(elapsedMs < 5000, `search took ${elapsedMs}ms`);
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /test.txt/);
+  assert.doesNotMatch(result.content[0].text, /still running/);
+  assert.ok(stderr.includes(`Covered by mgrep watch (pid ${process.argv[3]})`), stderr);
+  assert.doesNotMatch(stderr, /coordination test sync pass|Initial sync complete|Indexing complete/);
+  const root = fs.realpathSync(process.cwd());
+  const claimFile = `${process.env.MGREP_WATCH_REGISTRY_DIR}/${Buffer.from(`mgrep\0${root}`).toString('base64url')}.json`;
+  assert.equal(JSON.parse(fs.readFileSync(claimFile)).pid, Number(process.argv[3]));
+  process.kill(Number(process.argv[3]), 'SIGTERM');
+  await waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(claimFile)).pid === pid; }
+    catch { return false; }
+  });
+  await waitFor(() => stderr.includes('[LOG] Watching for file changes in'));
+  assert.equal((stderr.match(/coordination test sync pass/g) || []).length, failure === 'none' ? 1 : 2);
+  if (failure !== 'none') assert.match(stderr, /Failed to coordinate watcher:/);
+  assert.equal((stderr.match(/Initial sync complete/g) || []).length, 1);
+  fs.writeFileSync('takeover.txt', 'mcp-takeover-needle');
+  await waitFor(() => stderr.includes(`${root}/takeover.txt`));
+  const after = await client.callTool({name: 'search', arguments: {query: 'mcp-takeover-needle'}});
+  assert.match(after.content[0].text, /takeover.txt/);
+  console.log(JSON.stringify({elapsedMs: Math.round(elapsedMs), takeover: true}));
+} finally {
+  clearTimeout(deadline);
+  const child = transport._process;
+  const exited = child && child.exitCode === null && child.signalCode === null
+    ? new Promise(resolve => child.once('exit', resolve)) : Promise.resolve();
+  await client.close();
+  await exited;
+}
+assert.equal(fs.existsSync(`${process.env.MGREP_WATCH_REGISTRY_DIR}/${Buffer.from(`mgrep\0${fs.realpathSync(process.cwd())}`).toString('base64url')}.json`), false);
+JS
+    assert_success
+    assert_output --partial '"takeover":true'
+    wait "$active"
+    done
+}
+
+@test "startWatch can leave signal handling to MCP and still releases its claim on exit" {
+    run node --title=mgrep-signal-test --input-type=module - "$DIR/../dist" <<'JS'
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { pathToFileURL } from 'node:url';
+const base = pathToFileURL(`${process.argv[2]}/`).href;
+const { startWatch } = await import(`${base}commands/watch.js`);
+const { listActiveWatches } = await import(`${base}lib/lock.js`);
+const signals = ['SIGINT', 'SIGTERM'];
+const before = signals.map(signal => process.listenerCount(signal));
+const exitCount = process.listenerCount('exit');
+let closed = 0;
+fs.watch = () => {
+  const watcher = new EventEmitter();
+  watcher.close = () => { closed++; };
+  return watcher;
+};
+syncBuiltinESMExports();
+assert.equal(await startWatch({store: 'mgrep', dryRun: false, handleSignals: false}), true);
+assert.deepEqual(signals.map(signal => process.listenerCount(signal)), before);
+assert.equal(process.listenerCount('exit'), exitCount + 1);
+assert.ok(listActiveWatches('mgrep').some(claim => claim.pid === process.pid));
+process.emit('exit');
+assert.ok(closed > 0);
+assert.equal(listActiveWatches('mgrep').length, 0);
+JS
+    assert_success
 }

@@ -262,6 +262,7 @@ export const watchMcp = new Command("mcp")
           await startWatch({
             store: options.store,
             dryRun: false,
+            handleSignals: false,
             createStore: () => createStore({ interactive: false }),
           }),
         );

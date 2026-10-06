@@ -283,6 +283,20 @@ mgrep watch --max-file-size 1048576  # limit uploads to files under 1MB
 mgrep watch --max-file-count 5000  # limit sync to 5000 changed files or fewer
 ```
 
+#### Multiple sessions
+
+Watchers using the same store coordinate across sessions: the first started
+watcher owns each directory tree. Later sessions covered by it stand by without
+syncing or watching files, and take over when it exits. A parent started after a
+child watcher leaves that child's subtree to the child, then takes it over if
+the child exits.
+
+A folder containing `.mgreprc.yaml` or `.mgreprc.yml` is a configuration boundary:
+ancestor watchers always exclude it, so a session in that folder gets its own
+watcher. Boundaries are computed when a watcher becomes active, including on
+takeover; restart watchers after adding or removing local config files.
+Dry runs skip coordination.
+
 ## Mixedbread under the hood
 
 - Every file is pushed into a Mixedbread Store using the same SDK your apps get.
